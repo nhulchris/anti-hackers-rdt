@@ -26,7 +26,7 @@ anti-hackers-rdt/
 |  |- packet.py         # Task 1 -- packet format + checksum (DONE: starter provided)
 |  |- socket_layer.py   # Task 1 -- UDP send/recv wrapper (DONE: starter provided)
 |  |- constants.py      # Task 1 -- shared config
-|  |- sender.py         # Task 2 -- TODO
+|  |- sender.py         # Task 2 -- DONE (Go-Back-N sliding window, retransmission, ACK processing)
 |  |- receiver.py       # Task 3 -- TODO
 |  |- congestion.py     # Task 4 -- TODO
 |- tests/
