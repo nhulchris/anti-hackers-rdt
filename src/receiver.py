@@ -69,6 +69,13 @@ class Receiver:
         data = bytearray()
         while True:
             pkt, addr = self.sock.receive(timeout=None)
+            
+            if pkt.payload:
+                try:
+                    print(f"(In receiver)Message: {pkt.payload.decode('utf-8')}")
+                except UnicodeDecodeError:
+                    print(f"Raw bytes: {pkt.payload}")
+            
             if pkt is None:
                 continue
             delivered, ack, done = self.process(pkt)
