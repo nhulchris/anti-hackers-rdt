@@ -17,7 +17,7 @@ buffering + real flow control) is sketched at the bottom of this file.
 from socket_layer import UDPSocket
 from packet import Packet, ACK, FIN, DATA
 import constants
-
+import random
 
 class Receiver:
     def __init__(self, bind_addr=None):
@@ -25,6 +25,9 @@ class Receiver:
         self.sock = UDPSocket(bind_addr) if bind_addr is not None else None
         self.expected_seq = 0                       # next in-order seq we want
         self.advertised_window = constants.DEFAULT_WINDOW
+
+        #for testing
+        self.totalPayloadReceived = 0
 
     # ---- pure protocol logic (no sockets -> easy to unit-test) ----
     def process(self, pkt: Packet):
@@ -49,6 +52,7 @@ class Receiver:
         if pkt.has_flag(DATA) and pkt.seq_num == self.expected_seq:
             delivered = pkt.payload
             self.expected_seq += 1
+
         # Duplicates (seq < expected) and gaps (seq > expected) fall through:
         # we deliver nothing and just re-ACK the cumulative point.
 
@@ -69,7 +73,15 @@ class Receiver:
         data = bytearray()
         while True:
             pkt, addr = self.sock.receive(timeout=None)
-            
+
+            print(
+                f"(In receiver) Got packet: "
+                f"seq={pkt.seq_num}, "
+                f"ack={pkt.ack_num}, "
+                f"flags={pkt.flags}, "
+                f"payload_len={len(pkt.payload)}"
+            )
+
             if pkt.payload:
                 try:
                     print(f"(In receiver)Message: {pkt.payload.decode('utf-8')}")
@@ -79,11 +91,25 @@ class Receiver:
             if pkt is None:
                 continue
             delivered, ack, done = self.process(pkt)
+
             if delivered:
+                print(f"*** (In receiver) Packet received! Seq Num: {pkt.seq_num} ***")
+                
+                self.totalPayloadReceived += len(delivered)
+
                 data.extend(delivered)
                 if output_stream is not None:
                     output_stream.write(delivered)
+
+            if ack is not None:
+                if random.random() < constants.ACK_LOSS_PROBABILITY:
+                    print(f"*** Simulating lost ACK {ack.ack_num} ***")
+                    # Do NOT send the ACK
+                    continue
+                
+            print(f"(In receiver) Sending ACK {ack.ack_num}")
             self.sock.send(ack, addr)
+
             if done:
                 break
         return bytes(data)

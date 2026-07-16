@@ -16,7 +16,9 @@ import time
 
 from socket_layer import UDPSocket
 from packet import Packet, DATA, ACK, FIN
+from simulation import output_simulation_details
 import constants
+import time
 
 try:
     from congestion import CongestionControl
@@ -44,11 +46,25 @@ class Sender:
         # Task 4 integration: wire in congestion control, guard against NotImplementedError
         self._congestion = CongestionControl() if _CONGESTION_AVAILABLE else None
 
+        #for testing
+        self.startOfRoundTripTime = 0
+        self.endOfRoundTripTime = 0
+        self.roundTripTime = 0
+        self.allRoundTripTimes = []
+        self.numberOfRetransmissions = 0
+        self.transmissionStartTime = 0
+        self.transmissionEndTime = 0
+        self.totalTransmissionTime = 0
+        self.totalBytesSent = 0
+
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def send(self, data: bytes) -> None:
+        self.transmissionStartTime = time.time()
+
         """Reliably deliver `data` to the receiver using a Go-Back-N sliding window."""
         chunks = [
             data[i : i + constants.PAYLOAD_SIZE]
@@ -69,12 +85,17 @@ class Sender:
                     flags=DATA,
                     payload=chunks[self.next_seq],
                 )
+                
+                print(f"Sending DATA packet {pkt.seq_num}")
+
                 self._unacked[self.next_seq] = pkt
                 self.sock.send(pkt, self.dest_addr)
+                self.totalBytesSent += len(pkt.pack())
 
                 # Start the timer on the very first unACKed packet
                 if self._timer_start is None:
                     self._timer_start = time.time()
+                    self.startOfRoundTripTime = time.time()
 
                 self.next_seq += 1
 
@@ -91,9 +112,14 @@ class Sender:
                 self._retransmit()
             elif ack_pkt.is_valid() and ack_pkt.has_flag(ACK):
                 self._handle_ack(ack_pkt)
+                print(f"sender received ack: {ack_pkt.ack_num} self.base = {self.base}")
+
             # Corrupted or non-ACK packets are silently dropped; timer keeps running
 
         self._send_fin()
+
+        self.transmissionEndTime = time.time()
+        self.totalTransmissionTime = self.transmissionEndTime - self.transmissionStartTime
 
     def close(self) -> None:
         self.sock.close()
@@ -121,6 +147,9 @@ class Sender:
             self._timer_start = time.time()
         else:
             self._timer_start = None
+            self.endOfRoundTripTime = time.time()
+            self.roundTripTime = self.endOfRoundTripTime - self.startOfRoundTripTime;
+            self.allRoundTripTimes.append(self.roundTripTime)
 
         self._notify_congestion_ack()
 
@@ -131,6 +160,9 @@ class Sender:
         for seq in range(self.base, self.next_seq):
             pkt = self._unacked.get(seq)
             if pkt is not None:
+                print(f"(In sender)Retransmitting sequence number: {pkt.seq_num}")
+                self.numberOfRetransmissions += 1
+                self.totalBytesSent += len(pkt.pack())
                 self.sock.send(pkt, self.dest_addr)
 
         self._timer_start = time.time()
@@ -161,7 +193,7 @@ class Sender:
         elapsed = time.time() - self._timer_start
         return max(0.0, self._timeout - elapsed)
 
-    def _notify_congestion_ack(self) -> None:
+    def _notify_congestion_ack(self) -> Noneprint:
         try:
             if self._congestion is not None:
                 self._congestion.on_ack()
@@ -190,10 +222,14 @@ if __name__ == "__main__":
         with open(filepath, "rb") as f:
             payload = f.read()
     else:
-        payload = b"Hello from the Anti-Hackers RDT sender!\n" * 50
+        #payload = b"Hello from the Anti-Hackers RDT sender!\n" * 50
+        payload = b"Hello from the Anti-Hackers RDT sender!\n" * 1000
 
     print(f"Sending {len(payload)} bytes to {host}:{port} ...")
     sender = Sender(dest_addr=(host, port))
     sender.send(payload)
     sender.close()
+
+    output_simulation_details(sender)
+
     print("Done.")
