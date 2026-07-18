@@ -15,6 +15,7 @@ Header layout (15 bytes, network byte order):
 """
 
 import struct
+import random
 
 # ---- Header definition ----
 HEADER_FORMAT = "!IIBHHH"                      # ! = network (big-endian)
@@ -79,7 +80,9 @@ class Packet:
             HEADER_FORMAT, self.seq_num, self.ack_num, self.flags,
             self.window, length, 0,
         )
+
         return checksum(header_zero_cksum + self.payload) == self._received_checksum
+         
 
     def has_flag(self, flag) -> bool:
         return bool(self.flags & flag)
