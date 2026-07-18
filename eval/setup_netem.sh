@@ -13,10 +13,15 @@ IFACE="${1:-lo}"
 LOSS="${2:-0}"
 DELAY="${3:-0}"
 
-# Remove any existing rule first (ignore errors if none is set).
-sudo tc qdisc del dev "$IFACE" root 2>/dev/null
+# Use tc directly in a root-owned Docker lab, or sudo on a normal Linux host.
+if [[ "$EUID" -eq 0 ]]; then
+    TC=(tc)
+else
+    TC=(sudo tc)
+fi
 
-sudo tc qdisc add dev "$IFACE" root netem loss "${LOSS}%" delay "${DELAY}ms"
+# Replace any existing rule so interrupted experiment runs can restart cleanly.
+"${TC[@]}" qdisc replace dev "$IFACE" root netem loss "${LOSS}%" delay "${DELAY}ms"
 
 echo "Applied ${LOSS}% loss and ${DELAY}ms delay on ${IFACE}."
 echo "Clear it with: sudo tc qdisc del dev ${IFACE} root"

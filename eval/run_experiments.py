@@ -1,34 +1,287 @@
-"""
-run_experiments.py -- Sweep loss rates / RTTs and collect metrics (Task 4: Neha Virani).
+"""Sweep loss/delay settings and measure the RDT implementation (Task 4: Neha)."""
 
-TODO (Neha):
-  - For each loss rate in LOSS_RATES: apply netem (setup_netem.sh), run a transfer
-    between the sender and receiver, and record throughput, goodput, retransmission
-    count, and completion time.
-  - Save results to a CSV, then plot them with matplotlib (e.g. throughput vs loss rate).
-
-This is what produces the graphs for the final report, so keep the raw numbers.
-"""
-
-# import csv, subprocess, time
-# import matplotlib.pyplot as plt
-
-LOSS_RATES = [0, 1, 5, 10, 20]    # percent
-DELAYS_MS = [0, 20, 100]          # round-trip delay variants
+import argparse
+import csv
+import multiprocessing as mp
+import os
+import platform
+import queue
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
 
 
-def run_one(loss_pct, delay_ms):
-    """
-    TODO (Neha): apply netem for (loss_pct, delay_ms), run sender + receiver on a
-    test file, time the transfer, and return a dict of metrics.
-    """
-    raise NotImplementedError
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+sys.path.insert(0, str(SRC_DIR))
+
+import constants  # noqa: E402
+from packet import DATA  # noqa: E402
+from receiver import Receiver  # noqa: E402
+from sender import Sender  # noqa: E402
 
 
-def main():
-    """TODO (Neha): loop over LOSS_RATES (and DELAYS_MS), call run_one, write CSV, plot."""
-    raise NotImplementedError
+LOSS_RATES = [0, 1, 5, 10, 20]  # percent
+DELAYS_MS = [0, 20, 100]
+CSV_FIELDS = [
+    "loss_pct",
+    "delay_ms",
+    "payload_bytes",
+    "wire_bytes",
+    "data_packets",
+    "retransmissions",
+    "completion_seconds",
+    "throughput_mbps",
+    "goodput_mbps",
+    "verified",
+]
+
+
+def _make_payload(size):
+    """Build repeatable test data without needing a checked-in binary file."""
+    pattern = b"The Anti-Hackers reliable UDP test data.\n"
+    repeats = (size + len(pattern) - 1) // len(pattern)
+    return (pattern * repeats)[:size]
+
+
+def _transfer_worker(result_queue, payload):
+    """Run one transfer in a child process so a stalled trial can be stopped."""
+    receiver = None
+    sender = None
+    try:
+        receiver = Receiver((constants.LOCALHOST, 0))
+        port = receiver.sock.sock.getsockname()[1]
+        received = {}
+
+        def receive_data():
+            received["data"] = receiver.receive()
+
+        receiver_thread = threading.Thread(target=receive_data, daemon=True)
+        receiver_thread.start()
+
+        sender = Sender((constants.LOCALHOST, port))
+        original_send = sender.sock.send
+        counters = {"wire_bytes": 0, "data_packets": 0}
+        seen_sequences = set()
+
+        def counted_send(packet, address):
+            counters["wire_bytes"] += len(packet.pack())
+            if packet.has_flag(DATA):
+                counters["data_packets"] += 1
+                seen_sequences.add(packet.seq_num)
+            original_send(packet, address)
+
+        sender.sock.send = counted_send
+
+        started = time.perf_counter()
+        sender.send(payload)
+        elapsed = time.perf_counter() - started
+        sender.close()
+        sender = None
+
+        receiver_thread.join(timeout=3.0)
+        if receiver_thread.is_alive():
+            raise RuntimeError("receiver did not finish after the sender stopped")
+
+        delivered = received.get("data", b"")
+        retransmissions = counters["data_packets"] - len(seen_sequences)
+        result_queue.put(
+            {
+                "payload_bytes": len(payload),
+                "wire_bytes": counters["wire_bytes"],
+                "data_packets": counters["data_packets"],
+                "retransmissions": retransmissions,
+                "completion_seconds": round(elapsed, 6),
+                "throughput_mbps": round(counters["wire_bytes"] * 8 / elapsed / 1_000_000, 6),
+                "goodput_mbps": round(len(delivered) * 8 / elapsed / 1_000_000, 6),
+                "verified": delivered == payload,
+            }
+        )
+    except Exception as exc:
+        result_queue.put({"error": f"{type(exc).__name__}: {exc}"})
+    finally:
+        if sender is not None:
+            sender.close()
+        if receiver is not None:
+            receiver.close()
+
+
+def _run_transfer(payload_size, timeout):
+    result_queue = mp.Queue()
+    process = mp.Process(target=_transfer_worker, args=(result_queue, _make_payload(payload_size)))
+    process.start()
+    process.join(timeout=timeout)
+
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        raise TimeoutError(f"transfer did not finish within {timeout} seconds")
+
+    try:
+        result = result_queue.get(timeout=2.0)
+    except queue.Empty as exc:
+        raise RuntimeError(f"transfer process exited with code {process.exitcode}") from exc
+
+    if "error" in result:
+        raise RuntimeError(result["error"])
+    if not result["verified"]:
+        raise RuntimeError("received data did not match the test payload")
+    return result
+
+
+def apply_netem(interface, loss_pct, delay_ms):
+    """Apply a Linux tc/netem rule using the project setup script."""
+    if platform.system() != "Linux":
+        raise RuntimeError("tc/netem experiments require Linux or the Docker lab")
+
+    script = Path(__file__).with_name("setup_netem.sh")
+    subprocess.run(
+        ["bash", str(script), interface, str(loss_pct), str(delay_ms)],
+        check=True,
+    )
+
+
+def clear_netem(interface):
+    """Remove the test qdisc, ignoring the error when no rule is present."""
+    if platform.system() != "Linux":
+        return
+
+    command = ["tc", "qdisc", "del", "dev", interface, "root"]
+    if os.geteuid() != 0:
+        command.insert(0, "sudo")
+    subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def run_one(
+    loss_pct,
+    delay_ms,
+    interface="lo",
+    payload_size=256 * 1024,
+    timeout=60,
+    use_netem=True,
+):
+    """Run one transfer and return its configuration and measured metrics."""
+    if use_netem:
+        apply_netem(interface, loss_pct, delay_ms)
+    elif loss_pct != 0 or delay_ms != 0:
+        raise ValueError("nonzero loss/delay values require netem")
+
+    result = _run_transfer(payload_size, timeout)
+    result["loss_pct"] = loss_pct
+    result["delay_ms"] = delay_ms
+    return result
+
+
+def write_csv(results, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(results)
+
+
+def make_plot(results, output_path):
+    """Plot throughput and goodput against packet-loss percentage."""
+    output_path = Path(output_path)
+    mpl_config = output_path.parent / ".mplconfig"
+    mpl_config.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(mpl_config))
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    for delay_ms in sorted({row["delay_ms"] for row in results}):
+        rows = sorted(
+            (row for row in results if row["delay_ms"] == delay_ms),
+            key=lambda row: row["loss_pct"],
+        )
+        losses = [row["loss_pct"] for row in rows]
+        axes[0].plot(losses, [row["throughput_mbps"] for row in rows], marker="o",
+                     label=f"{delay_ms} ms")
+        axes[1].plot(losses, [row["goodput_mbps"] for row in rows], marker="o",
+                     label=f"{delay_ms} ms")
+
+    axes[0].set_title("Throughput")
+    axes[1].set_title("Goodput")
+    for axis in axes:
+        axis.set_xlabel("Packet loss (%)")
+        axis.set_ylabel("Mbps")
+        axis.grid(True, alpha=0.3)
+        axis.legend(title="Delay")
+
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=150)
+    plt.close(figure)
+
+
+def _number_list(value):
+    try:
+        return [float(item.strip()) for item in value.split(",")]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("use comma-separated numbers") from exc
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--loss-rates", type=_number_list, default=LOSS_RATES)
+    parser.add_argument("--delays", type=_number_list, default=DELAYS_MS)
+    parser.add_argument("--interface", default="lo")
+    parser.add_argument("--payload-bytes", type=int, default=256 * 1024)
+    parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--output-csv", default=str(PROJECT_ROOT / "eval" / "results.csv"))
+    parser.add_argument("--plot", default=str(PROJECT_ROOT / "eval" / "plots" / "performance.png"))
+    parser.add_argument(
+        "--skip-netem",
+        action="store_true",
+        help="run only a 0%% loss/0 ms local baseline without changing network rules",
+    )
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.payload_bytes <= 0:
+        raise SystemExit("--payload-bytes must be positive")
+    if args.skip_netem and (args.loss_rates != [0] or args.delays != [0]):
+        raise SystemExit("--skip-netem requires --loss-rates 0 --delays 0")
+
+    results = []
+    try:
+        for delay_ms in args.delays:
+            for loss_pct in args.loss_rates:
+                print(f"Running loss={loss_pct}% delay={delay_ms}ms ...", flush=True)
+                row = run_one(
+                    loss_pct,
+                    delay_ms,
+                    interface=args.interface,
+                    payload_size=args.payload_bytes,
+                    timeout=args.timeout,
+                    use_netem=not args.skip_netem,
+                )
+                results.append(row)
+                write_csv(results, args.output_csv)
+                print(
+                    f"  {row['completion_seconds']:.3f}s, "
+                    f"goodput={row['goodput_mbps']:.3f} Mbps, "
+                    f"retransmissions={row['retransmissions']}"
+                )
+    finally:
+        if not args.skip_netem:
+            clear_netem(args.interface)
+
+    make_plot(results, args.plot)
+    print(f"Saved raw results to {args.output_csv}")
+    print(f"Saved plot to {args.plot}")
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     main()

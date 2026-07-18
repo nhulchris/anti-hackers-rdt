@@ -28,12 +28,12 @@ anti-hackers-rdt/
 |  |- constants.py      # Task 1 -- shared config
 |  |- sender.py         # Task 2 -- DONE (Go-Back-N sliding window, retransmission, ACK processing)
 |  |- receiver.py       # Task 3 -- TODO
-|  |- congestion.py     # Task 4 -- TODO
+|  |- congestion.py     # Task 4 -- DONE (slow start + AIMD)
 |- tests/
 |  |- test_packet.py    # passes; template for the other tests
 |- eval/
 |  |- setup_netem.sh    # Task 4 -- loss/delay testbed
-|  |- run_experiments.py# Task 4 -- TODO
+|  |- run_experiments.py# Task 4 -- DONE (CSV metrics + plot)
 |  |- README.md
 |- docs/
    |- progress_report_1.md
@@ -62,6 +62,17 @@ pytest
 ```
 `tests/test_packet.py` already passes against the provided packet format -- use it as a
 template for `test_sender.py`, `test_receiver.py`, and `test_congestion.py`.
+
+## Congestion-control evaluation
+Run the full loss/delay sweep in the Linux Docker lab:
+```
+python eval/run_experiments.py
+```
+For a local zero-loss baseline that does not change network settings:
+```
+python eval/run_experiments.py --skip-netem --loss-rates 0 --delays 0
+```
+The experiment writes raw CSV measurements and a throughput/goodput plot under `eval/`.
 
 ## Branching workflow
 - `main` always runs. Nobody commits directly to `main`.
