@@ -193,7 +193,7 @@ class Sender:
         elapsed = time.time() - self._timer_start
         return max(0.0, self._timeout - elapsed)
 
-    def _notify_congestion_ack(self) -> Noneprint:
+    def _notify_congestion_ack(self) -> None:
         try:
             if self._congestion is not None:
                 self._congestion.on_ack()
