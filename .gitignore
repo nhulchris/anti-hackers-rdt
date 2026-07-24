@@ -20,5 +20,4 @@ htmlcov/
 .DS_Store
 
 # Experiment output
-eval/plots/
-*.csv
+received_output.dat

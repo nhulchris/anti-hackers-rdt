@@ -173,7 +173,8 @@ class Sender:
         for _ in range(3):
             self.sock.send(fin_pkt, self.dest_addr)
             ack_pkt, _ = self.sock.receive(timeout=self._timeout)
-            if ack_pkt is not None and ack_pkt.is_valid() and ack_pkt.has_flag(ACK):
+            if ack_pkt is not None and ack_pkt.is_valid() and ack_pkt.has_flag(ACK) and ack_pkt.has_flag(FIN):
+                # Only the receiver's FIN-ACK confirms teardown; stale data ACKs do not.
                 return
         # Best-effort: if no FIN-ACK arrives after retries, proceed with teardown
 

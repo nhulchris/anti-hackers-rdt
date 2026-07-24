@@ -36,6 +36,7 @@ CSV_FIELDS = [
     "throughput_mbps",
     "goodput_mbps",
     "verified",
+    "simulated",
 ]
 
 
@@ -46,11 +47,13 @@ def _make_payload(size):
     return (pattern * repeats)[:size]
 
 
-def _transfer_worker(result_queue, payload):
+def _transfer_worker(result_queue, payload, sim_loss_pct=0.0, sim_delay_ms=0.0):
     """Run one transfer in a child process so a stalled trial can be stopped."""
     receiver = None
     sender = None
     try:
+        if sim_loss_pct or sim_delay_ms:
+            _install_simulated_impairment(sim_loss_pct, sim_delay_ms)
         receiver = Receiver((constants.LOCALHOST, 0))
         port = receiver.sock.sock.getsockname()[1]
         received = {}
@@ -108,9 +111,40 @@ def _transfer_worker(result_queue, payload):
             receiver.close()
 
 
-def _run_transfer(payload_size, timeout):
+def _install_simulated_impairment(loss_pct, delay_ms):
+    """Software substitute for tc/netem: drop and delay outgoing datagrams.
+
+    Patches UDPSocket.send in this process so BOTH directions (data and ACKs)
+    experience loss/delay, approximating what netem does on the loopback device.
+    Results produced this way are labeled simulated=yes in the CSV.
+    """
+    import random
+    import socket_layer
+
+    rng = random.Random(4600)  # fixed seed -> reproducible runs
+    real_send = socket_layer.UDPSocket.send
+    p_drop = loss_pct / 100.0
+    delay_s = delay_ms / 1000.0 / 2.0  # netem delay is per direction; split RTT evenly
+
+    def impaired_send(self, packet, addr):
+        if p_drop and rng.random() < p_drop:
+            return  # dropped on the wire
+        if delay_s:
+            timer = threading.Timer(delay_s, real_send, args=(self, packet, addr))
+            timer.daemon = True
+            timer.start()
+        else:
+            real_send(self, packet, addr)
+
+    socket_layer.UDPSocket.send = impaired_send
+
+
+def _run_transfer(payload_size, timeout, sim_loss_pct=0.0, sim_delay_ms=0.0):
     result_queue = mp.Queue()
-    process = mp.Process(target=_transfer_worker, args=(result_queue, _make_payload(payload_size)))
+    process = mp.Process(
+        target=_transfer_worker,
+        args=(result_queue, _make_payload(payload_size), sim_loss_pct, sim_delay_ms),
+    )
     process.start()
     process.join(timeout=timeout)
 
@@ -160,17 +194,26 @@ def run_one(
     interface="lo",
     payload_size=256 * 1024,
     timeout=60,
-    use_netem=True,
+    mode="netem",
 ):
-    """Run one transfer and return its configuration and measured metrics."""
-    if use_netem:
-        apply_netem(interface, loss_pct, delay_ms)
-    elif loss_pct != 0 or delay_ms != 0:
-        raise ValueError("nonzero loss/delay values require netem")
+    """Run one transfer and return its configuration and measured metrics.
 
-    result = _run_transfer(payload_size, timeout)
+    mode: "netem"    -> real kernel impairment via tc/netem (Linux only)
+          "simulate" -> software loss/delay injected at the socket layer (any OS)
+          "baseline" -> no impairment; loss/delay must be 0
+    """
+    sim_loss = sim_delay = 0.0
+    if mode == "netem":
+        apply_netem(interface, loss_pct, delay_ms)
+    elif mode == "simulate":
+        sim_loss, sim_delay = loss_pct, delay_ms
+    elif loss_pct != 0 or delay_ms != 0:
+        raise ValueError("nonzero loss/delay values require netem or --simulate-loss")
+
+    result = _run_transfer(payload_size, timeout, sim_loss, sim_delay)
     result["loss_pct"] = loss_pct
     result["delay_ms"] = delay_ms
+    result["simulated"] = "yes" if mode == "simulate" else "no"
     return result
 
 
@@ -243,6 +286,12 @@ def build_parser():
         action="store_true",
         help="run only a 0%% loss/0 ms local baseline without changing network rules",
     )
+    parser.add_argument(
+        "--simulate-loss",
+        action="store_true",
+        help="inject loss/delay in software at the socket layer (no netem/Linux needed); "
+             "results are labeled simulated in the CSV",
+    )
     return parser
 
 
@@ -250,8 +299,17 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.payload_bytes <= 0:
         raise SystemExit("--payload-bytes must be positive")
+    if args.skip_netem and args.simulate_loss:
+        raise SystemExit("choose one of --skip-netem or --simulate-loss")
     if args.skip_netem and (args.loss_rates != [0] or args.delays != [0]):
         raise SystemExit("--skip-netem requires --loss-rates 0 --delays 0")
+
+    if args.simulate_loss:
+        mode = "simulate"
+    elif args.skip_netem:
+        mode = "baseline"
+    else:
+        mode = "netem"
 
     results = []
     try:
@@ -264,7 +322,7 @@ def main(argv=None):
                     interface=args.interface,
                     payload_size=args.payload_bytes,
                     timeout=args.timeout,
-                    use_netem=not args.skip_netem,
+                    mode=mode,
                 )
                 results.append(row)
                 write_csv(results, args.output_csv)
@@ -274,7 +332,7 @@ def main(argv=None):
                     f"retransmissions={row['retransmissions']}"
                 )
     finally:
-        if not args.skip_netem:
+        if mode == "netem":
             clear_netem(args.interface)
 
     make_plot(results, args.plot)
