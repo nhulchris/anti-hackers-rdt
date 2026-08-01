@@ -1,8 +1,8 @@
 """
-test_sender.py -- unit tests for the Go-Back-N sender. Run with: pytest
+test_sender.py -- unit tests for the sliding-window sender. Run with: pytest
 
-These use a FakeSocket instead of the network, so we can script exactly which ACKs
-arrive (or don't) and observe what the sender transmits in response.
+Tests drive Sender's internal logic with a fake socket so no real network I/O
+occurs, mirroring the approach used in test_receiver.py for Receiver.process().
 """
 
 import os
@@ -11,109 +11,227 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import constants  # noqa: E402
+from congestion import CongestionControl  # noqa: E402
 from packet import Packet, ACK, DATA, FIN  # noqa: E402
-import sender as sender_module  # noqa: E402
 from sender import Sender  # noqa: E402
 
 
 class FakeSocket:
-    """Stands in for UDPSocket: records sends, replays a scripted list of replies."""
+    """Stand-in for UDPSocket: captures outgoing packets and returns canned ACKs."""
 
-    def __init__(self, replies=None):
-        self.sent = []                  # every Packet the sender transmitted
-        self.replies = list(replies or [])
+    def __init__(self, responses=None):
+        self.sent = []                          # list of (Packet, addr)
+        self._responses = list(responses or []) # list of (Packet|None, addr|None)
 
     def send(self, packet, addr):
-        self.sent.append(packet)
+        self.sent.append((packet, addr))
 
     def receive(self, timeout=None):
-        if self.replies:
-            return self.replies.pop(0), ("127.0.0.1", 9000)
-        return None, None               # behaves like a timeout
+        if self._responses:
+            return self._responses.pop(0)
+        return None, None
 
     def close(self):
         pass
 
 
-def ack(n):
-    """A valid ACK packet as the receiver would build it (round-tripped for checksum)."""
-    return Packet.unpack(Packet(ack_num=n, flags=ACK).pack())
-
-
-def make_sender(replies):
+def _make_sender(responses=None):
+    """Create a Sender backed by a FakeSocket; no real UDP socket is used."""
     s = Sender(dest_addr=("127.0.0.1", 9000))
-    s.sock.close()                      # discard the real socket
-    s.sock = FakeSocket(replies)
-    s._timeout = 0.05                   # keep timeout-path tests fast
+    s.sock = FakeSocket(responses or [])
     return s
 
 
-def data_packets(fake):
-    return [p for p in fake.sent if p.has_flag(DATA)]
+def _ack(ack_num):
+    """Return a (Packet, addr) tuple for use as a FakeSocket canned response."""
+    return Packet.unpack(Packet(ack_num=ack_num, flags=ACK).pack()), ("127.0.0.1", 9000)
 
 
-def test_small_payload_single_packet_and_fin():
-    payload = b"x" * 100                # fits in one packet
-    s = make_sender([ack(1), ack(1)])   # ACK the data, then ACK the FIN
-    s.send(payload)
-
-    datas = data_packets(s.sock)
-    assert len(datas) == 1
-    assert datas[0].seq_num == 0
-    assert datas[0].payload == payload
-    assert any(p.has_flag(FIN) for p in s.sock.sent)
+def _finack():
+    """FIN-ACK response, matching what the real receiver sends (ACK | FIN)."""
+    return Packet.unpack(Packet(flags=ACK | FIN).pack()), ("127.0.0.1", 9000)
 
 
-def test_payload_is_chunked_and_reassembles():
-    payload = b"A" * (constants.PAYLOAD_SIZE * 2 + 10)   # 3 packets
-    # ACK one at a time, like a real receiver (window starts at 1 in slow start).
-    s = make_sender([ack(1), ack(2), ack(3), ack(3)])
-    s.send(payload)
+# ---- _handle_ack (pure state logic) ----
 
-    datas = data_packets(s.sock)
-    assert [p.seq_num for p in datas] == [0, 1, 2]
-    assert b"".join(p.payload for p in datas) == payload
+def test_handle_ack_advances_base():
+    s = _make_sender()
+    s._unacked[0] = Packet(seq_num=0, flags=DATA, payload=b"A")
+    s.base = 0
+    s.next_seq = 1
+    s._timer_start = 0.0
+
+    s._handle_ack(Packet.unpack(Packet(ack_num=1, flags=ACK).pack()))
+
+    assert s.base == 1
+    assert 0 not in s._unacked
 
 
-def test_cumulative_ack_slides_base():
-    payload = b"B" * (constants.PAYLOAD_SIZE * 3)        # 3 packets
-    # First ACK opens the window (slow start); one cumulative ack(3) then
-    # confirms the remaining two packets at once.
-    s = make_sender([ack(1), ack(3), ack(3)])
-    s.send(payload)
+def test_handle_ack_clears_entire_window_and_stops_timer():
+    s = _make_sender()
+    for i in range(3):
+        s._unacked[i] = Packet(seq_num=i, flags=DATA, payload=b"X")
+    s.base = 0
+    s.next_seq = 3
+    s._timer_start = 0.0
+
+    s._handle_ack(Packet.unpack(Packet(ack_num=3, flags=ACK).pack()))
+
     assert s.base == 3
-    assert s._unacked == {}             # nothing left in flight
+    assert s._unacked == {}
+    assert s._timer_start is None   # no packets in flight: timer stopped
 
 
-class TimeoutThenAcks(FakeSocket):
-    """None in the script simulates a timeout; anything else is delivered."""
+def test_handle_ack_restarts_timer_when_packets_still_in_flight():
+    s = _make_sender()
+    for i in range(3):
+        s._unacked[i] = Packet(seq_num=i, flags=DATA, payload=b"X")
+    s.base = 0
+    s.next_seq = 3
+    s._timer_start = 0.0
 
-    def receive(self, timeout=None):
-        r = self.replies.pop(0) if self.replies else None
-        return (r, ("127.0.0.1", 9000)) if r is not None else (None, None)
+    # ACK only the first packet; two remain in flight
+    s._handle_ack(Packet.unpack(Packet(ack_num=1, flags=ACK).pack()))
+
+    assert s.base == 1
+    assert 0 not in s._unacked
+    assert s._timer_start is not None   # timer restarted for remaining packets
+
+
+def test_duplicate_ack_is_ignored():
+    s = _make_sender()
+    s._unacked[0] = Packet(seq_num=0, flags=DATA, payload=b"A")
+    s.base = 2
+    s.next_seq = 3
+    s._timer_start = 0.0
+
+    # ack_num=1 is below base=2 -- stale ACK
+    s._handle_ack(Packet.unpack(Packet(ack_num=1, flags=ACK).pack()))
+
+    assert s.base == 2          # unchanged
+    assert 0 in s._unacked      # nothing cleared
+
+
+# ---- _retransmit ----
+
+def test_retransmit_resends_all_unacked_in_order():
+    s = _make_sender()
+    for i in range(3):
+        s._unacked[i] = Packet(seq_num=i, flags=DATA, payload=f"p{i}".encode())
+    s.base = 0
+    s.next_seq = 3
+
+    s._retransmit()
+
+    sent_seqs = [p.seq_num for p, _ in s.sock.sent]
+    assert sent_seqs == [0, 1, 2]
+
+
+def test_retransmit_increments_counter_each_call():
+    s = _make_sender()
+    s._unacked[0] = Packet(seq_num=0, flags=DATA, payload=b"A")
+    s.base = 0
+    s.next_seq = 1
+
+    s._retransmit()
+    s._retransmit()
+
+    assert s.numberOfRetransmissions == 2
+
+
+# ---- _effective_window ----
+
+def test_effective_window_without_congestion_returns_sender_window():
+    s = _make_sender()
+    s._congestion = None
+    s.window = 7
+    assert s._effective_window() == 7
+
+
+def test_effective_window_congestion_is_the_bottleneck():
+    s = _make_sender()
+    s.window = 10
+    cc = CongestionControl()
+    cc.cwnd = 3.0
+    s._congestion = cc
+    assert s._effective_window() == 3
+
+
+def test_effective_window_sender_window_is_the_bottleneck():
+    s = _make_sender()
+    s.window = 2
+    cc = CongestionControl()
+    cc.cwnd = 20.0
+    s._congestion = cc
+    assert s._effective_window() == 2
+
+
+# ---- send() end-to-end ----
+
+def test_send_empty_data_sends_only_fin():
+    s = _make_sender([_finack()])  # FIN-ACK
+
+    s.send(b"")
+
+    data_pkts = [p for p, _ in s.sock.sent if p.has_flag(DATA)]
+    fin_pkts  = [p for p, _ in s.sock.sent if p.has_flag(FIN)]
+    assert data_pkts == []
+    assert len(fin_pkts) >= 1
+
+
+def test_send_single_chunk_delivers_payload_and_fin():
+    s = _make_sender([_ack(1), _finack()])  # data ACK, then FIN-ACK
+
+    s.send(b"hello world")
+
+    data_pkts = [p for p, _ in s.sock.sent if p.has_flag(DATA)]
+    fin_pkts  = [p for p, _ in s.sock.sent if p.has_flag(FIN)]
+    assert len(data_pkts) == 1
+    assert data_pkts[0].payload == b"hello world"
+    assert len(fin_pkts) >= 1
+
+
+def test_send_multiple_chunks_reassembles_correctly():
+    payload = b"Z" * (constants.PAYLOAD_SIZE * 3)
+    responses = [_ack(1), _ack(2), _ack(3), _finack()]  # 3 data ACKs + FIN-ACK
+    s = _make_sender(responses)
+
+    s.send(payload)
+
+    data_pkts = [p for p, _ in s.sock.sent if p.has_flag(DATA)]
+    assert len(data_pkts) == 3
+    assert b"".join(p.payload for p in data_pkts) == payload
+
+
+def test_fin_not_confirmed_by_stale_data_ack():
+    # A leftover cumulative data ACK (ACK flag only) must NOT be mistaken for the
+    # FIN-ACK; otherwise the sender tears down while its FIN may have been lost and
+    # the receiver is still waiting. The sender should keep resending the FIN.
+    s = _make_sender([_ack(1), _ack(5), _ack(5)])  # data ACK, then only stale data ACKs
+
+    s.send(b"hello world")
+
+    fin_pkts = [p for p, _ in s.sock.sent if p.has_flag(FIN)]
+    assert len(fin_pkts) == 3  # retried the full 3 times, never falsely confirmed
 
 
 def test_timeout_triggers_retransmission():
-    payload = b"C" * constants.PAYLOAD_SIZE             # 1 packet in flight (cwnd=1)
-    s = make_sender([])
-    # Timeout first -> Go-Back-N resends the in-flight packet -> then ACKs arrive.
-    s.sock = TimeoutThenAcks([None, ack(1), ack(1)])
+    # cwnd starts at 1, so exactly one packet is in flight. A (None, None) response
+    # simulates a timeout -> Go-Back-N resends the in-flight packet -> then the ACK
+    # arrives and the transfer completes. (Ported from the origin/main suite.)
+    payload = b"C" * constants.PAYLOAD_SIZE
+    s = _make_sender([(None, None), _ack(1), _finack()])
+
     s.send(payload)
 
-    datas = data_packets(s.sock)
-    assert [p.seq_num for p in datas] == [0, 0]          # original + retransmission
+    data_pkts = [p for p, _ in s.sock.sent if p.has_flag(DATA)]
+    assert [p.seq_num for p in data_pkts] == [0, 0]   # original + retransmission
     assert s.numberOfRetransmissions == 1
 
 
-def test_stale_duplicate_ack_does_not_move_base():
-    payload = b"D" * (constants.PAYLOAD_SIZE * 2)
-    s = make_sender([ack(1), ack(1), ack(2), ack(2)])    # dup ack(1) in the middle
-    s.send(payload)
-    assert s.base == 2                  # finished correctly despite the duplicate
+def test_send_tracks_bytes_sent():
+    s = _make_sender([_ack(1), _finack()])
 
+    s.send(b"abc")
 
-def test_zero_length_payload_sends_only_fin():
-    s = make_sender([ack(0)])
-    s.send(b"")
-    assert data_packets(s.sock) == []
-    assert any(p.has_flag(FIN) for p in s.sock.sent)
+    assert s.totalBytesSent > 0
