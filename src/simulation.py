@@ -23,31 +23,32 @@ def output_simulation_details(sender):
 	averageRoundTripTime = 0
 	throughput = 0
 
-	print("Round Trip Times: ")
+	print("Round Trip Times:")
 	for i in range(1, len(sender.allRoundTripTimes)):
-		print(sender.allRoundTripTimes[i])
-		averageRoundTripTime += sender.allRoundTripTimes[i]
+		rtt = sender.allRoundTripTimes[i]
+		print(f"  {rtt * 1000:9.2f} ms")
+		averageRoundTripTime += rtt
 
 	averageRoundTripTime /= len(sender.allRoundTripTimes)
 
-	print("\nAverage Round Trip Time: ")
-	print(averageRoundTripTime)
+	print("\nAverage Round Trip Time:")
+	print(f"  {averageRoundTripTime * 1000:.2f} ms  ({averageRoundTripTime:.4f} s)")
 	print()
 
-	print("Number of Retransmissions: ")
-	print(sender.numberOfRetransmissions)
+	print("Number of Retransmissions:")
+	print(f"  {sender.numberOfRetransmissions} packets")
 	print()
 
 	print("Total Transmission Time:")
-	print(sender.totalTransmissionTime)
+	print(f"  {sender.totalTransmissionTime:.3f} s")
 	print()
 
 	print("Total bytes sent:")
-	print(sender.totalBytesSent)
+	print(f"  {sender.totalBytesSent:,} bytes")
 	print()
 
 	throughput = sender.totalBytesSent/sender.totalTransmissionTime
 
 	print("Throughput:")
-	print(f"{int(throughput)} bytes/sec")
+	print(f"  {int(throughput):,} bytes/sec  ({throughput * 8 / 1_000_000:.2f} Mbps)")
 	print()
