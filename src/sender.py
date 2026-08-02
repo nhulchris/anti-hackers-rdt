@@ -111,8 +111,11 @@ class Sender:
                 # Timeout expired
                 self._retransmit()
             elif ack_pkt.is_valid() and ack_pkt.has_flag(ACK):
-                self._handle_ack(ack_pkt)
-                print(f"sender received ack: {ack_pkt.ack_num} self.base = {self.base}")
+                rtt = self._handle_ack(ack_pkt)
+                if rtt is not None:
+                    print(f"sender received ack: {ack_pkt.ack_num} self.base = {self.base}  |  RTT: {rtt * 1000:.2f} ms")
+                else:
+                    print(f"sender received ack: {ack_pkt.ack_num} self.base = {self.base}")
 
             # Corrupted or non-ACK packets are silently dropped; timer keeps running
 
@@ -142,7 +145,8 @@ class Sender:
 
         self.base = new_base
 
-        # Restart timer if there are still packets in flight; stop it if the window is clean
+# Restart timer if there are still packets in flight; stop it if the window is clean
+        new_rtt = None
         if self._unacked:
             self._timer_start = time.time()
         else:
@@ -150,8 +154,10 @@ class Sender:
             self.endOfRoundTripTime = time.time()
             self.roundTripTime = self.endOfRoundTripTime - self.startOfRoundTripTime;
             self.allRoundTripTimes.append(self.roundTripTime)
+            new_rtt = self.roundTripTime
 
         self._notify_congestion_ack()
+        return new_rtt
 
     def _retransmit(self) -> None:
         """Go-Back-N: resend every unACKed packet in sequence order."""
